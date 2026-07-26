@@ -1,100 +1,78 @@
 # DeepSeek Reasoning Bridge
 
-`deepseek-reasoning-bridge` is a dynamic CPA (CLIProxyAPI) plugin that preserves DeepSeek reasoning state across tool-call turns and OpenAI, Anthropic, and Gemini protocol translations without changing CPA core.
+`deepseek-reasoning-bridge` 是一个 CPA（CLIProxyAPI）动态插件，用于在工具调用的多轮交互以及 OpenAI、Anthropic、Gemini 协议转换过程中保留 DeepSeek 推理内容。
 
-DeepSeek returns `reasoning_content` with an assistant tool call and requires the same value to be replayed in the next request. Clients and OpenAI/Anthropic/Gemini conversions can otherwise drop it, causing HTTP 400 responses such as:
+该插件已在本机 CPA `v7.2.88` 环境中完成实际测试。
 
-> The reasoning_content in the thinking mode must be passed back to the API.
+## 功能
 
-## Behavior
+- 捕获与工具调用关联的 `reasoning_content` 和 Claude `thinking`。
+- 根据完整、精确的工具调用 ID 集合，在下一次请求中恢复推理内容。
+- 支持流式和非流式请求。
+- 支持 OpenAI、Claude 和 Gemini 协议链路。
+- 精确推理内容不可用时，支持可配置的回退策略。
+- 推理内容仅保存在内存中，不改写响应正文或 SSE 事件。
 
-The plugin registers CPA request/response interceptors plus request and pre-translation response normalizers.
+## 构建
 
-- Response interceptors capture only complete reasoning associated with a non-empty set of tool-call IDs.
-- Streaming reasoning deltas are accumulated per response before being cached.
-- The cache key is the sorted, exact tool-call ID set—not the model name—so unrelated turns do not share a model-wide value.
-- OpenAI requests missing `reasoning_content` recover it from the exact tool-call entry.
-- Claude requests recover or preserve a `thinking` block and receive a structurally GPT-compatible signature immediately before CPA translates the next request.
-- Gemini responses are observed in their upstream OpenAI form before CPA translates them. On the next turn, the Gemini request normalizer restores `reasoning_content` after CPA's Gemini-to-OpenAI conversion.
-- Response bodies and SSE events are observed but never rewritten.
-- The issue #37635 `reasoning_content` → `content` rewrite is intentionally not implemented because ordinary DeepSeek thinking chunks have the same shape and cannot be distinguished safely.
-
-If no exact cache entry exists, the configured fallback is used. `content` first uses assistant answer text and then the placeholder; `placeholder` always uses the placeholder; `passthrough` leaves the request unchanged.
-
-## Build and test
-
-Requires Go 1.23+ with cgo enabled.
+需要 Go 1.23+ 并启用 cgo。
 
 ```bash
 make test
 make build
 ```
 
-The library is written to `bin/deepseek-reasoning-bridge.dylib` on macOS, `.so` on Linux, or `.dll` on Windows.
+macOS 构建产物为 `bin/deepseek-reasoning-bridge.dylib`，Linux 为 `.so`，Windows 为 `.dll`。
 
-## Install
+## 部署到 CPA
 
-Copy the shared library into CPA's plugin directory, then configure CPA:
+将构建产物复制到 CPA 当前版本对应的平台插件目录。以 macOS arm64 为例：
 
-```yaml
-openai-compatibility:
-  - name: "deepseek"
-    base-url: "https://api.deepseek.com/v1"
-    api-key-entries:
-      - api-key: "sk-..."
-    models:
-      - name: "deepseek-chat"
-        alias: "deepseek-chat"
-        thinking:
-          levels: ["low", "medium", "high"]
-
-plugins:
-  enabled: true
-  dir: "plugins"
-  configs:
-    deepseek-reasoning-bridge:
-      enabled: true
-      priority: 10
-      target_models:
-        - "deepseek-*"
-      fallback_strategy: "content"
-      placeholder_text: "[reasoning unavailable]"
-      cache_ttl: "2h"
-      cache_max_entries: 10000
+```bash
+cp bin/deepseek-reasoning-bridge.dylib \
+  "$HOME/Library/Application Support/Quotio/proxy/upstream/<version>/plugins/darwin/arm64/deepseek-reasoning-bridge-v0.5.0.dylib"
 ```
 
-Restart CPA after installing or replacing the library.
+文件名应包含插件版本号。热重载时，新版本号必须高于已经部署的版本，CPA 才会选择新动态库。
 
-## Runtime dashboard
+在 CPA 配置文件的 `plugins.configs` 下添加：
 
-Version `0.5.0` registers a read-only CPA Management API resource. Open the following URL on the CPA server:
+```yaml
+deepseek-reasoning-bridge:
+  enabled: true
+  priority: 10
+  target_models:
+    - "deepseek-*"
+  fallback_strategy: "content"
+  placeholder_text: "[reasoning unavailable]"
+  cache_ttl: "2h"
+  cache_max_entries: 10000
+```
+
+复制动态库后，修改一次 CPA 配置以触发插件热重载。部署过程中不要删除或修改其他 CPA 数据文件。
+
+## 运行监控
+
+Dashboard 地址：
 
 ```text
 /v0/resource/plugins/deepseek-reasoning-bridge/status
 ```
 
-The page reports uptime, protocol traffic, exact-cache hit rate, fallback usage, repaired messages, cache occupancy, active/completed streams, expiration/eviction counts, and correlation errors. Metrics are retrieved only when the page or endpoint is requested; there is no automatic refresh or background polling. Reload the page manually to obtain a new snapshot. Request the same URL with `Accept: application/json`, or append `?format=json`, for a machine-readable snapshot.
+监控指标默认为手动拉取。页面或接口仅在收到请求时生成一次快照，不会自动刷新或在后台轮询。添加 `?format=json`，或发送 `Accept: application/json` 请求头，可获取 JSON 数据。
 
-CPA resource routes are not management-authenticated. Apply the same listener, reverse-proxy, and network access controls used for other CPA resource pages. The plugin intentionally exposes aggregate counters and a limited configuration summary only; it never includes reasoning text, tool-call IDs, request bodies, placeholder text, API keys, or credentials. Counters are in-memory and reset when the plugin process restarts.
+Dashboard 仅提供聚合运行指标，包括协议流量、缓存命中率、回退使用量、修复消息数、流状态、缓存生命周期事件和关联错误。它不会暴露推理文本、工具调用 ID、请求正文、API Key 或其他凭据。
 
-## Migrating from `deepseek-thinking`
+CPA 资源路由可能不受管理接口认证保护。请使用与其他 CPA 资源页面相同的监听地址、反向代理和网络访问控制。
 
-Version `0.4.0` adopts the formal plugin ID `deepseek-reasoning-bridge`. Remove the old `deepseek-thinking` library, install the newly named library, and rename `plugins.configs.deepseek-thinking` to `plugins.configs.deepseek-reasoning-bridge` before restarting CPA. Running both identities at once would register duplicate hooks and is not supported.
+## 配置项
 
-## Configuration
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `target_models` | `['deepseek-*']` | 插件处理的模型模式，不区分大小写。 |
+| `fallback_strategy` | `content` | 可选值：`content`、`placeholder`、`passthrough`。 |
+| `placeholder_text` | `[reasoning unavailable]` | 使用占位回退策略时填充的文本。 |
+| `cache_ttl` | `2h` | 推理缓存和未完成流状态的有效期。 |
+| `cache_max_entries` | `10000` | 已完成推理缓存和活动流状态各自的最大条目数。 |
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `target_models` | string or list | `["deepseek-*"]` | Case-insensitive shell globs checked by request and response hooks. |
-| `fallback_strategy` | enum | `content` | `content`, `placeholder`, or `passthrough`. Exact tool-call cache recovery always takes priority. |
-| `placeholder_text` | string | `[reasoning unavailable]` | Last-resort text for `content`, or fixed text for `placeholder`. |
-| `cache_ttl` | duration | `2h` | Lifetime of completed reasoning entries and unfinished stream state. |
-| `cache_max_entries` | integer | `10000` | Independent maximum for completed entries and active streams. Oldest entries are evicted first. |
-
-## Safety and limitations
-
-- Reasoning is held in process memory for the configured TTL. It is not logged or persisted; a plugin/CPA restart loses exact Gemini round-trip recovery for earlier turns.
-- Correlation relies on provider-generated tool-call IDs being unique and replayed unchanged by the client.
-- CPA exposes the Gemini request normalizer only after native Gemini-to-OpenAI conversion, so an externally seeded Gemini history cannot have `thought:true` separated from ordinary text by this plugin. Exact cache recovery takes priority; otherwise the configured fallback applies.
-- The synthetic Claude signature is a CPA transport-compatibility marker. It is attached on the next request, not injected into Anthropic response events.
-- The default target remains `deepseek-*`; other providers require explicit model patterns and compatibility testing.
+推理内容仅存储在进程内存中，CPA 或插件重启后会丢失。精确恢复依赖客户端原样回传唯一的工具调用 ID。
