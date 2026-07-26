@@ -1,0 +1,6 @@
+/bin/
+/deepseek-thinking-plugin
+*.dylib
+*.so
+*.dll
+*.h
