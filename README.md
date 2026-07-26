@@ -119,3 +119,9 @@ CPA resource routes may not be protected by management authentication. Apply the
 推理内容仅存储在进程内存中，CPA 或插件重启后会丢失。精确恢复依赖客户端原样回传唯一的工具调用 ID。插件升级后，请使用新产生的 tool call 验证；升级前已经丢失的原始 reasoning 无法事后恢复。
 
 Reasoning is stored in process memory only and is lost when CPA or the plugin restarts. Exact recovery depends on clients replaying unique tool-call IDs unchanged. After upgrading the plugin, validate with newly generated tool calls; reasoning already lost before the upgrade cannot be reconstructed afterward.
+
+## Community / 社区
+
+学 AI，上 L 站。
+
+LinuxDO: https://linux.do/
