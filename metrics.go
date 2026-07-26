@@ -8,7 +8,7 @@ import (
 const (
 	pluginID      = "deepseek-reasoning-bridge"
 	pluginName    = "DeepSeek Reasoning Bridge"
-	pluginVersion = "0.5.0"
+	pluginVersion = "0.5.2"
 )
 
 type runtimeMetricStore struct {

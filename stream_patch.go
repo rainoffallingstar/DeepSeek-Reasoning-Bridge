@@ -117,6 +117,44 @@ func (store *streamStore) Finish(key string) {
 	reasoningEntries.Put(ids, state.Reasoning.String())
 }
 
+func (store *streamStore) FindReasoning(toolCallIDs []string) (string, bool) {
+	if store == nil {
+		return "", false
+	}
+	requestedKey := toolCallKey(toolCallIDs)
+	if requestedKey == "" {
+		return "", false
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	now := store.now()
+	store.cleanupLocked(now)
+	store.lastCleanup = now
+
+	matchedReasoning := ""
+	matchCount := 0
+	for _, state := range store.states {
+		stateToolCallIDs := make([]string, 0, len(state.ToolIDs))
+		for toolCallID := range state.ToolIDs {
+			stateToolCallIDs = append(stateToolCallIDs, toolCallID)
+		}
+		if toolCallKey(stateToolCallIDs) != requestedKey {
+			continue
+		}
+		reasoning := state.Reasoning.String()
+		if strings.TrimSpace(reasoning) == "" {
+			continue
+		}
+		matchedReasoning = reasoning
+		matchCount++
+		if matchCount > 1 {
+			return "", false
+		}
+	}
+	return matchedReasoning, matchCount == 1
+}
+
 func (store *streamStore) Len() int {
 	if store == nil {
 		return 0

@@ -246,6 +246,52 @@ func TestStreamTerminalDoesNotCountAsMalformed(t *testing.T) {
 	}
 }
 
+func TestInterruptedOpenAIStreamRestoresReasoningOnResend(t *testing.T) {
+	cfg := resetTestState(t)
+	captureStreamChunk([]byte(`{"id":"resp_interrupted","choices":[{"index":0,"delta":{"reasoning_content":"Need to read the file first."},"finish_reason":null}]}`), nil, nil)
+	captureStreamChunk([]byte(`{"id":"resp_interrupted","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_read","type":"function","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":null}]}`), nil, nil)
+
+	resentRequest := []byte(`{"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_read","type":"function","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}]},{"role":"user","content":"continue"}]}`)
+	patchedRequest := patchOpenAIRequest(resentRequest, cfg)
+	if patchedRequest == nil {
+		t.Fatal("expected interrupted tool call request to be repaired")
+	}
+	if got := gjson.GetBytes(patchedRequest, "messages.0.reasoning_content").String(); got != "Need to read the file first." {
+		t.Fatalf("interrupted stream reasoning = %q", got)
+	}
+}
+
+func TestInterruptedClaudeStreamRestoresThinkingOnResend(t *testing.T) {
+	cfg := resetTestState(t)
+	start := []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_interrupted\"}}\n\n")
+	thinking := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Need to read the file first.\"}}\n\n")
+	tool := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_claude_read\",\"name\":\"read\",\"input\":{\"path\":\"README.md\"}}}\n\n")
+	captureStreamChunk(start, nil, nil)
+	captureStreamChunk(thinking, [][]byte{start}, nil)
+	captureStreamChunk(tool, [][]byte{start, thinking}, nil)
+
+	resentRequest := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_claude_read","name":"read","input":{"path":"README.md"}}]},{"role":"user","content":"continue"}]}`)
+	patchedRequest := patchClaudeRequest(resentRequest, cfg)
+	if patchedRequest == nil {
+		t.Fatal("expected interrupted Claude tool call request to be repaired")
+	}
+	if got := gjson.GetBytes(patchedRequest, "messages.0.content.0.thinking").String(); got != "Need to read the file first." {
+		t.Fatalf("interrupted Claude stream thinking = %q", got)
+	}
+	if got := gjson.GetBytes(patchedRequest, "messages.0.content.1.type").String(); got != "tool_use" {
+		t.Fatalf("Claude tool_use moved incorrectly: %q", got)
+	}
+}
+
+func TestActiveStreamRecoveryRejectsAmbiguousToolCallIDs(t *testing.T) {
+	store := newStreamStore(time.Hour, 10)
+	store.Add("openai:response-a:0", "reasoning A", []string{"call_duplicate"})
+	store.Add("openai:response-b:0", "reasoning B", []string{"call_duplicate"})
+	if reasoning, ok := store.FindReasoning([]string{"call_duplicate"}); ok {
+		t.Fatalf("ambiguous active streams must not match, got %q", reasoning)
+	}
+}
+
 func TestCaptureOpenAIStreamAccumulatesCompleteReasoning(t *testing.T) {
 	resetTestState(t)
 	captureStreamChunk([]byte(`{"id":"resp_1","choices":[{"index":0,"delta":{"reasoning_content":"I need "},"finish_reason":null}]}`), nil, nil)
@@ -440,6 +486,43 @@ func TestGeminiNonStreamingRoundTripRestoresReasoning(t *testing.T) {
 	body := interceptorBody(t, rawNormalized)
 	if got := gjson.GetBytes(body, "messages.0.reasoning_content").String(); got != "reason before tool" {
 		t.Fatalf("round-trip reasoning_content = %q", got)
+	}
+}
+
+func TestClaudeStreamingRoundTripRestoresReasoning(t *testing.T) {
+	resetTestState(t)
+	chunks := [][]byte{
+		[]byte(`data: {"id":"chatcmpl_claude","choices":[{"index":0,"delta":{"reasoning_content":"streamed "},"finish_reason":null}]}`),
+		[]byte(`data: {"id":"chatcmpl_claude","choices":[{"index":0,"delta":{"reasoning_content":"reasoning","tool_calls":[{"index":0,"id":"call_stream_claude"}]},"finish_reason":null}]}`),
+		[]byte(`data: {"id":"chatcmpl_claude","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`),
+	}
+	for _, chunk := range chunks {
+		responseRequest := responseTransformRequest{
+			FromFormat: "openai",
+			ToFormat:   "claude",
+			Model:      "deepseek-chat",
+			Stream:     true,
+			Body:       chunk,
+		}
+		rawResponseRequest, _ := json.Marshal(responseRequest)
+		if _, errHandle := handleMethod("response.normalize_before", rawResponseRequest); errHandle != nil {
+			t.Fatal(errHandle)
+		}
+	}
+
+	request := requestInterceptRequest{
+		SourceFormat: "claude",
+		Model:        "deepseek-chat",
+		Body:         []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_stream_claude","name":"lookup","input":{}}]},{"role":"user","content":"continue"}]}`),
+	}
+	rawRequest, _ := json.Marshal(request)
+	rawIntercepted, errHandle := handleMethod("request.intercept_after", rawRequest)
+	if errHandle != nil {
+		t.Fatal(errHandle)
+	}
+	body := interceptorBody(t, rawIntercepted)
+	if got := gjson.GetBytes(body, "messages.0.content.0.thinking").String(); got != "streamed reasoning" {
+		t.Fatalf("Claude round-trip thinking = %q", got)
 	}
 }
 

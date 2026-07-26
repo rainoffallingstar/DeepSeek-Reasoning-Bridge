@@ -17,6 +17,17 @@ const (
 	fallbackKindPassthrough fallbackKind = "passthrough"
 )
 
+func getReasoningForToolCallIDs(toolCallIDs []string) (string, bool) {
+	if text, ok := reasoningEntries.Get(toolCallIDs); ok {
+		return text, true
+	}
+	if text, ok := streamEntries.FindReasoning(toolCallIDs); ok {
+		reasoningEntries.Put(toolCallIDs, text)
+		return text, true
+	}
+	return "", false
+}
+
 func patchOpenAIRequest(body []byte, cfg PluginConfig) []byte {
 	if !gjson.ValidBytes(body) {
 		runtimeMetrics.malformedPayloads.Add(1)
@@ -49,7 +60,7 @@ func patchOpenAIRequest(body []byte, cfg PluginConfig) []byte {
 			continue
 		}
 
-		text, ok := reasoningEntries.Get(toolCallIDs)
+		text, ok := getReasoningForToolCallIDs(toolCallIDs)
 		if ok {
 			runtimeMetrics.cacheHits.Add(1)
 		} else {
@@ -110,7 +121,7 @@ func patchClaudeRequest(body []byte, cfg PluginConfig) []byte {
 			if strings.TrimSpace(thinkingText) != "" {
 				reasoningEntries.Put(toolCallIDs, thinkingText)
 			} else {
-				thinkingText, ok := reasoningEntries.Get(toolCallIDs)
+				thinkingText, ok := getReasoningForToolCallIDs(toolCallIDs)
 				if ok {
 					runtimeMetrics.cacheHits.Add(1)
 				} else {
@@ -143,7 +154,7 @@ func patchClaudeRequest(body []byte, cfg PluginConfig) []byte {
 			continue
 		}
 
-		text, ok := reasoningEntries.Get(toolCallIDs)
+		text, ok := getReasoningForToolCallIDs(toolCallIDs)
 		if ok {
 			runtimeMetrics.cacheHits.Add(1)
 		} else {

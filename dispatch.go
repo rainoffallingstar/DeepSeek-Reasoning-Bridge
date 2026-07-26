@@ -229,7 +229,8 @@ func handleResponseNormalizeBefore(requestBytes []byte) ([]byte, error) {
 		return nil, fmt.Errorf("decode response.normalize_before: %w", err)
 	}
 	runtimeMetrics.responseNormalizations.Add(1)
-	if !formatPair(req.FromFormat, req.ToFormat, "openai", "gemini") {
+	if !formatPair(req.FromFormat, req.ToFormat, "openai", "gemini") &&
+		!formatPair(req.FromFormat, req.ToFormat, "openai", "claude") {
 		return okEnvelopeJSON(`{}`)
 	}
 	cfg := getConfig()
