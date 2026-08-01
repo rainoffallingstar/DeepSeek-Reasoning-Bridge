@@ -340,7 +340,7 @@ func TestCaptureClaudeSSEStreamUsesHistoryIdentity(t *testing.T) {
 	}
 }
 
-func TestCaptureClaudeStreamUsesMetadataAfterHistoryEviction(t *testing.T) {
+func TestCaptureClaudeStreamWithoutResponseIdentityIsIgnored(t *testing.T) {
 	resetTestState(t)
 	metadata := map[string]any{"execution_session_id": "session-long"}
 	thinking := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"long thought\"}}\n\n")
@@ -349,8 +349,11 @@ func TestCaptureClaudeStreamUsesMetadataAfterHistoryEviction(t *testing.T) {
 	captureStreamChunk(thinking, nil, metadata)
 	captureStreamChunk(tool, nil, metadata)
 	captureStreamChunk(finish, nil, metadata)
-	if got, ok := reasoningEntries.Get([]string{"call_long"}); !ok || got != "long thought" {
-		t.Fatalf("metadata-correlated stream reasoning = %q, %v", got, ok)
+	if _, ok := reasoningEntries.Get([]string{"call_long"}); ok {
+		t.Fatal("stream without a response-scoped identity must not be cached")
+	}
+	if streamEntries.Len() != 0 {
+		t.Fatal("stream without a response-scoped identity must not create active state")
 	}
 }
 
@@ -798,6 +801,79 @@ func TestDashboardSnapshotIsRaceSafe(t *testing.T) {
 	workers.Wait()
 	if got := currentDashboardSnapshot(time.Now()).Restoration.ExactCacheHits; got != 800 {
 		t.Fatalf("concurrent cache hits = %d", got)
+	}
+}
+
+func TestReasoningCacheEnforcesByteBudget(t *testing.T) {
+	cache := newReasoningCache(time.Hour, 10)
+	cache.Configure(time.Hour, 10, 5)
+	if !cache.Put([]string{"first"}, "abc") || !cache.Put([]string{"second"}, "def") {
+		t.Fatal("expected cache writes within byte budget")
+	}
+	if cache.Bytes() != 3 {
+		t.Fatalf("cache bytes = %d, want 3 after eviction", cache.Bytes())
+	}
+	if _, found := cache.Get([]string{"first"}); found {
+		t.Fatal("oldest entry must be evicted when the byte budget is exceeded")
+	}
+	if cache.Put([]string{"oversize"}, "abcdef") {
+		t.Fatal("entry larger than the complete cache budget must be rejected")
+	}
+}
+
+func TestStreamStoreExpiresAtAbsoluteDeadlineAndIdleTimeout(t *testing.T) {
+	store := newStreamStore(time.Minute, 10)
+	store.Configure(time.Minute, 10*time.Second, 10, 1024)
+	currentTime := time.Unix(1_000, 0)
+	store.now = func() time.Time { return currentTime }
+
+	store.Add("stream", "first", nil)
+	initialExpiry := store.states["stream"].ExpiresAt
+	currentTime = currentTime.Add(9 * time.Second)
+	store.Add("stream", "second", nil)
+	if got := store.states["stream"].ExpiresAt; !got.Equal(initialExpiry) {
+		t.Fatalf("stream expiry changed from %s to %s", initialExpiry, got)
+	}
+
+	currentTime = initialExpiry.Add(time.Second)
+	store.cleanupLocked(currentTime)
+	if store.Len() != 0 {
+		t.Fatal("stream must expire at its absolute lifetime deadline")
+	}
+
+	store.Add("idle", "thought", nil)
+	currentTime = currentTime.Add(10 * time.Second)
+	store.cleanupLocked(currentTime)
+	if store.Len() != 0 {
+		t.Fatal("idle stream must expire after the configured idle timeout")
+	}
+}
+
+func TestStreamStoreTruncatesOversizeReasoningWithoutCachingIt(t *testing.T) {
+	resetTestState(t)
+	store := newStreamStore(time.Hour, 10)
+	store.Configure(time.Hour, time.Hour, 10, 5)
+	store.Add("stream", "abcdef", []string{"call_truncated"})
+	state := store.states["stream"]
+	if state == nil || state.Reasoning.Len() != 5 || !state.ReasoningTruncated {
+		t.Fatalf("stream state = %#v", state)
+	}
+	store.Finish("stream")
+	if _, found := reasoningEntries.Get([]string{"call_truncated"}); found {
+		t.Fatal("truncated reasoning must not be promoted into the completed cache")
+	}
+}
+
+func TestLoadConfigSupportsMemoryAndStreamLimits(t *testing.T) {
+	cfg, errLoad := loadConfig([]byte("cache_max_bytes: 1024\nstream_max_lifetime: 5m\nstream_idle_ttl: 1m\nstream_max_reasoning_bytes: 512\n"))
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if cfg.CacheMaxBytes != 1024 || cfg.StreamMaxLifetime != 5*time.Minute || cfg.StreamIdleTTL != time.Minute || cfg.StreamMaxReasoningBytes != 512 {
+		t.Fatalf("loaded config = %+v", cfg)
+	}
+	if _, errLoad := loadConfig([]byte("stream_max_lifetime: 1m\nstream_idle_ttl: 2m\n")); errLoad == nil {
+		t.Fatal("idle timeout longer than stream lifetime must be rejected")
 	}
 }
 

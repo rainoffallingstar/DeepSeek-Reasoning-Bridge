@@ -9,6 +9,7 @@ import (
 
 type reasoningEntry struct {
 	Text      string
+	SizeBytes int
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
@@ -18,6 +19,8 @@ type reasoningCache struct {
 	entries     map[string]reasoningEntry
 	ttl         time.Duration
 	maxEntries  int
+	maxBytes    int
+	totalBytes  int
 	lastCleanup time.Time
 	now         func() time.Time
 	observe     bool
@@ -25,6 +28,7 @@ type reasoningCache struct {
 
 var reasoningEntries = func() *reasoningCache {
 	cache := newReasoningCache(defaultCacheTTL, defaultCacheMaxEntries)
+	cache.maxBytes = defaultCacheMaxBytes
 	cache.observe = true
 	return cache
 }()
@@ -34,11 +38,12 @@ func newReasoningCache(ttl time.Duration, maxEntries int) *reasoningCache {
 		entries:    make(map[string]reasoningEntry),
 		ttl:        ttl,
 		maxEntries: maxEntries,
+		maxBytes:   defaultCacheMaxBytes,
 		now:        time.Now,
 	}
 }
 
-func (cache *reasoningCache) Configure(ttl time.Duration, maxEntries int) {
+func (cache *reasoningCache) Configure(ttl time.Duration, maxEntries, maxBytes int) {
 	if cache == nil {
 		return
 	}
@@ -49,6 +54,9 @@ func (cache *reasoningCache) Configure(ttl time.Duration, maxEntries int) {
 	}
 	if maxEntries > 0 {
 		cache.maxEntries = maxEntries
+	}
+	if maxBytes > 0 {
+		cache.maxBytes = maxBytes
 	}
 	now := cache.now()
 	cache.deleteExpiredLocked(now)
@@ -64,16 +72,27 @@ func (cache *reasoningCache) Put(toolCallIDs []string, text string) bool {
 	if key == "" {
 		return false
 	}
-
+	textSizeBytes := len(text)
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
+	if cache.maxBytes > 0 && textSizeBytes > cache.maxBytes {
+		if cache.observe {
+			runtimeMetrics.cacheEntryTooLarge.Add(1)
+		}
+		return false
+	}
 	now := cache.now()
 	cache.cleanupIfDueLocked(now)
+	if existing, exists := cache.entries[key]; exists {
+		cache.totalBytes -= existing.SizeBytes
+	}
 	cache.entries[key] = reasoningEntry{
 		Text:      text,
+		SizeBytes: textSizeBytes,
 		CreatedAt: now,
 		ExpiresAt: now.Add(cache.ttl),
 	}
+	cache.totalBytes += textSizeBytes
 	if cache.observe {
 		runtimeMetrics.cacheWrites.Add(1)
 	}
@@ -98,7 +117,7 @@ func (cache *reasoningCache) Get(toolCallIDs []string) (string, bool) {
 		return "", false
 	}
 	if !entry.ExpiresAt.After(now) {
-		delete(cache.entries, key)
+		cache.deleteEntryLocked(key, entry)
 		if cache.observe {
 			runtimeMetrics.cacheExpired.Add(1)
 		}
@@ -117,12 +136,23 @@ func (cache *reasoningCache) Len() int {
 	return len(cache.entries)
 }
 
+func (cache *reasoningCache) Bytes() int {
+	if cache == nil {
+		return 0
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	cache.deleteExpiredLocked(cache.now())
+	return cache.totalBytes
+}
+
 func (cache *reasoningCache) Reset() {
 	if cache == nil {
 		return
 	}
 	cache.mu.Lock()
 	cache.entries = make(map[string]reasoningEntry)
+	cache.totalBytes = 0
 	cache.lastCleanup = time.Time{}
 	cache.mu.Unlock()
 }
@@ -142,7 +172,7 @@ func (cache *reasoningCache) deleteExpiredLocked(now time.Time) {
 	expired := 0
 	for key, entry := range cache.entries {
 		if !entry.ExpiresAt.After(now) {
-			delete(cache.entries, key)
+			cache.deleteEntryLocked(key, entry)
 			expired++
 		}
 	}
@@ -153,20 +183,38 @@ func (cache *reasoningCache) deleteExpiredLocked(now time.Time) {
 
 func (cache *reasoningCache) evictOverflowLocked() {
 	evicted := 0
-	for cache.maxEntries > 0 && len(cache.entries) > cache.maxEntries {
-		oldestKey := ""
-		var oldestTime time.Time
-		for key, entry := range cache.entries {
-			if oldestKey == "" || entry.CreatedAt.Before(oldestTime) || (entry.CreatedAt.Equal(oldestTime) && key < oldestKey) {
-				oldestKey = key
-				oldestTime = entry.CreatedAt
-			}
+	for (cache.maxEntries > 0 && len(cache.entries) > cache.maxEntries) ||
+		(cache.maxBytes > 0 && cache.totalBytes > cache.maxBytes) {
+		oldestKey, oldestEntry := cache.oldestEntryLocked()
+		if oldestKey == "" {
+			break
 		}
-		delete(cache.entries, oldestKey)
+		cache.deleteEntryLocked(oldestKey, oldestEntry)
 		evicted++
 	}
 	if cache.observe && evicted > 0 {
 		runtimeMetrics.cacheEvicted.Add(uint64(evicted))
+	}
+}
+
+func (cache *reasoningCache) oldestEntryLocked() (string, reasoningEntry) {
+	oldestKey := ""
+	var oldestEntry reasoningEntry
+	for key, entry := range cache.entries {
+		if oldestKey == "" || entry.CreatedAt.Before(oldestEntry.CreatedAt) ||
+			(entry.CreatedAt.Equal(oldestEntry.CreatedAt) && key < oldestKey) {
+			oldestKey = key
+			oldestEntry = entry
+		}
+	}
+	return oldestKey, oldestEntry
+}
+
+func (cache *reasoningCache) deleteEntryLocked(key string, entry reasoningEntry) {
+	delete(cache.entries, key)
+	cache.totalBytes -= entry.SizeBytes
+	if cache.totalBytes < 0 {
+		cache.totalBytes = 0
 	}
 }
 

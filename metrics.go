@@ -8,7 +8,7 @@ import (
 const (
 	pluginID      = "deepseek-reasoning-bridge"
 	pluginName    = "DeepSeek Reasoning Bridge"
-	pluginVersion = "0.5.2"
+	pluginVersion = "0.5.3"
 )
 
 type runtimeMetricStore struct {
@@ -32,16 +32,19 @@ type runtimeMetricStore struct {
 	passthroughFallbacks atomic.Uint64
 	repairedMessages     atomic.Uint64
 
-	cacheWrites      atomic.Uint64
-	cacheExpired     atomic.Uint64
-	cacheEvicted     atomic.Uint64
-	completedStreams atomic.Uint64
-	streamExpired    atomic.Uint64
-	streamEvicted    atomic.Uint64
+	cacheWrites              atomic.Uint64
+	cacheExpired             atomic.Uint64
+	cacheEvicted             atomic.Uint64
+	cacheEntryTooLarge       atomic.Uint64
+	completedStreams         atomic.Uint64
+	streamExpired            atomic.Uint64
+	streamEvicted            atomic.Uint64
+	streamReasoningTruncated atomic.Uint64
 
 	malformedPayloads  atomic.Uint64
 	missingToolCallIDs atomic.Uint64
 	missingStreamIDs   atomic.Uint64
+	recoveredPanics    atomic.Uint64
 }
 
 var runtimeMetrics = newRuntimeMetricStore()
@@ -65,9 +68,10 @@ func (metrics *runtimeMetricStore) Reset(now time.Time) {
 		&metrics.cacheHits, &metrics.cacheMisses, &metrics.contentFallbacks,
 		&metrics.placeholderFallbacks, &metrics.passthroughFallbacks,
 		&metrics.repairedMessages, &metrics.cacheWrites, &metrics.cacheExpired,
-		&metrics.cacheEvicted, &metrics.completedStreams, &metrics.streamExpired,
-		&metrics.streamEvicted, &metrics.malformedPayloads,
-		&metrics.missingToolCallIDs, &metrics.missingStreamIDs,
+		&metrics.cacheEvicted, &metrics.cacheEntryTooLarge, &metrics.completedStreams,
+		&metrics.streamExpired, &metrics.streamEvicted, &metrics.streamReasoningTruncated,
+		&metrics.malformedPayloads, &metrics.missingToolCallIDs, &metrics.missingStreamIDs,
+		&metrics.recoveredPanics,
 	} {
 		counter.Store(0)
 	}
@@ -128,25 +132,31 @@ type dashboardRestoration struct {
 }
 
 type dashboardCapture struct {
-	ReasoningWrites  uint64 `json:"reasoning_writes"`
-	CompletedStreams uint64 `json:"completed_streams"`
+	ReasoningWrites          uint64 `json:"reasoning_writes"`
+	CompletedStreams         uint64 `json:"completed_streams"`
+	TruncatedStreamReasoning uint64 `json:"truncated_stream_reasoning"`
 }
 
 type dashboardCache struct {
-	ReasoningEntries int    `json:"reasoning_entries"`
-	ActiveStreams    int    `json:"active_streams"`
-	Capacity         int    `json:"capacity"`
-	TTL              string `json:"ttl"`
-	ExpiredEntries   uint64 `json:"expired_entries"`
-	EvictedEntries   uint64 `json:"evicted_entries"`
-	ExpiredStreams   uint64 `json:"expired_streams"`
-	EvictedStreams   uint64 `json:"evicted_streams"`
+	ReasoningEntries  int    `json:"reasoning_entries"`
+	ReasoningBytes    int    `json:"reasoning_bytes"`
+	ActiveStreams     int    `json:"active_streams"`
+	ActiveStreamBytes int    `json:"active_stream_bytes"`
+	Capacity          int    `json:"capacity"`
+	ByteCapacity      int    `json:"byte_capacity"`
+	TTL               string `json:"ttl"`
+	ExpiredEntries    uint64 `json:"expired_entries"`
+	EvictedEntries    uint64 `json:"evicted_entries"`
+	RejectedOversize  uint64 `json:"rejected_oversize_entries"`
+	ExpiredStreams    uint64 `json:"expired_streams"`
+	EvictedStreams    uint64 `json:"evicted_streams"`
 }
 
 type dashboardErrors struct {
 	MalformedPayloads  uint64 `json:"malformed_payloads"`
 	MissingToolCallIDs uint64 `json:"missing_tool_call_ids"`
 	MissingStreamIDs   uint64 `json:"missing_stream_ids"`
+	RecoveredPanics    uint64 `json:"recovered_panics"`
 }
 
 type dashboardConfiguration struct {
@@ -211,23 +221,29 @@ func currentDashboardSnapshot(now time.Time) dashboardSnapshot {
 			RepairedMessages:     runtimeMetrics.repairedMessages.Load(),
 		},
 		Capture: dashboardCapture{
-			ReasoningWrites:  runtimeMetrics.cacheWrites.Load(),
-			CompletedStreams: runtimeMetrics.completedStreams.Load(),
+			ReasoningWrites:          runtimeMetrics.cacheWrites.Load(),
+			CompletedStreams:         runtimeMetrics.completedStreams.Load(),
+			TruncatedStreamReasoning: runtimeMetrics.streamReasoningTruncated.Load(),
 		},
 		Cache: dashboardCache{
-			ReasoningEntries: reasoningEntries.Len(),
-			ActiveStreams:    streamEntries.Len(),
-			Capacity:         cfg.CacheMaxEntries,
-			TTL:              cfg.CacheTTL.String(),
-			ExpiredEntries:   runtimeMetrics.cacheExpired.Load(),
-			EvictedEntries:   runtimeMetrics.cacheEvicted.Load(),
-			ExpiredStreams:   runtimeMetrics.streamExpired.Load(),
-			EvictedStreams:   runtimeMetrics.streamEvicted.Load(),
+			ReasoningEntries:  reasoningEntries.Len(),
+			ReasoningBytes:    reasoningEntries.Bytes(),
+			ActiveStreams:     streamEntries.Len(),
+			ActiveStreamBytes: streamEntries.Bytes(),
+			Capacity:          cfg.CacheMaxEntries,
+			ByteCapacity:      cfg.CacheMaxBytes,
+			TTL:               cfg.CacheTTL.String(),
+			ExpiredEntries:    runtimeMetrics.cacheExpired.Load(),
+			EvictedEntries:    runtimeMetrics.cacheEvicted.Load(),
+			RejectedOversize:  runtimeMetrics.cacheEntryTooLarge.Load(),
+			ExpiredStreams:    runtimeMetrics.streamExpired.Load(),
+			EvictedStreams:    runtimeMetrics.streamEvicted.Load(),
 		},
 		Errors: dashboardErrors{
 			MalformedPayloads:  runtimeMetrics.malformedPayloads.Load(),
 			MissingToolCallIDs: runtimeMetrics.missingToolCallIDs.Load(),
 			MissingStreamIDs:   runtimeMetrics.missingStreamIDs.Load(),
+			RecoveredPanics:    runtimeMetrics.recoveredPanics.Load(),
 		},
 		Configuration: dashboardConfiguration{
 			TargetModelCount: len(cfg.TargetModels),

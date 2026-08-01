@@ -11,45 +11,62 @@ import (
 )
 
 type streamState struct {
-	Reasoning strings.Builder
-	ToolIDs   map[string]struct{}
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	Reasoning          strings.Builder
+	ReasoningTruncated bool
+	ToolIDs            map[string]struct{}
+	CreatedAt          time.Time
+	LastUpdatedAt      time.Time
+	ExpiresAt          time.Time
 }
 
 type streamStore struct {
-	mu          sync.Mutex
-	states      map[string]*streamState
-	ttl         time.Duration
-	maxEntries  int
-	lastCleanup time.Time
-	now         func() time.Time
-	observe     bool
+	mu                sync.Mutex
+	states            map[string]*streamState
+	maxLifetime       time.Duration
+	idleTTL           time.Duration
+	maxEntries        int
+	maxReasoningBytes int
+	lastCleanup       time.Time
+	now               func() time.Time
+	observe           bool
 }
 
 var streamEntries = func() *streamStore {
-	store := newStreamStore(defaultCacheTTL, defaultCacheMaxEntries)
+	store := newStreamStore(defaultStreamMaxLifetime, defaultCacheMaxEntries)
+	store.idleTTL = defaultStreamIdleTTL
+	store.maxReasoningBytes = defaultStreamMaxReasoningBytes
 	store.observe = true
 	return store
 }()
 
-func newStreamStore(ttl time.Duration, maxEntries int) *streamStore {
+func newStreamStore(maxLifetime time.Duration, maxEntries int) *streamStore {
 	return &streamStore{
-		states:     make(map[string]*streamState),
-		ttl:        ttl,
-		maxEntries: maxEntries,
-		now:        time.Now,
+		states:            make(map[string]*streamState),
+		maxLifetime:       maxLifetime,
+		idleTTL:           defaultStreamIdleTTL,
+		maxEntries:        maxEntries,
+		maxReasoningBytes: defaultStreamMaxReasoningBytes,
+		now:               time.Now,
 	}
 }
 
-func (store *streamStore) Configure(ttl time.Duration, maxEntries int) {
+func (store *streamStore) Configure(maxLifetime, idleTTL time.Duration, maxEntries, maxReasoningBytes int) {
+	if store == nil {
+		return
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if ttl > 0 {
-		store.ttl = ttl
+	if maxLifetime > 0 {
+		store.maxLifetime = maxLifetime
+	}
+	if idleTTL > 0 {
+		store.idleTTL = idleTTL
 	}
 	if maxEntries > 0 {
 		store.maxEntries = maxEntries
+	}
+	if maxReasoningBytes > 0 {
+		store.maxReasoningBytes = maxReasoningBytes
 	}
 	now := store.now()
 	store.cleanupLocked(now)
@@ -58,30 +75,32 @@ func (store *streamStore) Configure(ttl time.Duration, maxEntries int) {
 }
 
 func (store *streamStore) Add(key, reasoning string, toolIDs []string) {
-	if key == "" {
+	if store == nil || key == "" {
 		return
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	now := store.now()
+	store.cleanupIfDueLocked(now)
 	state := store.states[key]
-	if state != nil && !state.ExpiresAt.After(now) {
+	if state == nil {
+		state = &streamState{
+			ToolIDs:       make(map[string]struct{}),
+			CreatedAt:     now,
+			LastUpdatedAt: now,
+			ExpiresAt:     now.Add(store.maxLifetime),
+		}
+		store.states[key] = state
+	}
+	if !state.ExpiresAt.After(now) {
 		delete(store.states, key)
 		if store.observe {
 			runtimeMetrics.streamExpired.Add(1)
 		}
-		state = nil
+		return
 	}
-	store.cleanupIfDueLocked(now)
-	if state == nil {
-		state = &streamState{
-			ToolIDs:   make(map[string]struct{}),
-			CreatedAt: now,
-		}
-		store.states[key] = state
-	}
-	state.ExpiresAt = now.Add(store.ttl)
-	state.Reasoning.WriteString(reasoning)
+	state.LastUpdatedAt = now
+	store.appendReasoningLocked(state, reasoning)
 	for _, id := range toolIDs {
 		if id = strings.TrimSpace(id); id != "" {
 			state.ToolIDs[id] = struct{}{}
@@ -90,14 +109,37 @@ func (store *streamStore) Add(key, reasoning string, toolIDs []string) {
 	store.evictOverflowLocked()
 }
 
+func (store *streamStore) appendReasoningLocked(state *streamState, reasoning string) {
+	if state == nil || reasoning == "" || state.ReasoningTruncated {
+		return
+	}
+	remainingBytes := store.maxReasoningBytes - state.Reasoning.Len()
+	if remainingBytes <= 0 {
+		state.ReasoningTruncated = true
+		if store.observe {
+			runtimeMetrics.streamReasoningTruncated.Add(1)
+		}
+		return
+	}
+	if len(reasoning) > remainingBytes {
+		state.Reasoning.WriteString(reasoning[:remainingBytes])
+		state.ReasoningTruncated = true
+		if store.observe {
+			runtimeMetrics.streamReasoningTruncated.Add(1)
+		}
+		return
+	}
+	state.Reasoning.WriteString(reasoning)
+}
+
 func (store *streamStore) Finish(key string) {
-	if key == "" {
+	if store == nil || key == "" {
 		return
 	}
 	store.mu.Lock()
 	state := store.states[key]
 	delete(store.states, key)
-	if state != nil && !state.ExpiresAt.After(store.now()) {
+	if state != nil && store.stateExpiredLocked(state, store.now()) {
 		if store.observe {
 			runtimeMetrics.streamExpired.Add(1)
 		}
@@ -113,6 +155,9 @@ func (store *streamStore) Finish(key string) {
 	}
 	if store.observe {
 		runtimeMetrics.completedStreams.Add(1)
+	}
+	if state.ReasoningTruncated {
+		return
 	}
 	reasoningEntries.Put(ids, state.Reasoning.String())
 }
@@ -135,6 +180,9 @@ func (store *streamStore) FindReasoning(toolCallIDs []string) (string, bool) {
 	matchedReasoning := ""
 	matchCount := 0
 	for _, state := range store.states {
+		if state.ReasoningTruncated {
+			continue
+		}
 		stateToolCallIDs := make([]string, 0, len(state.ToolIDs))
 		for toolCallID := range state.ToolIDs {
 			stateToolCallIDs = append(stateToolCallIDs, toolCallID)
@@ -165,7 +213,24 @@ func (store *streamStore) Len() int {
 	return len(store.states)
 }
 
+func (store *streamStore) Bytes() int {
+	if store == nil {
+		return 0
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.cleanupLocked(store.now())
+	totalBytes := 0
+	for _, state := range store.states {
+		totalBytes += state.Reasoning.Len()
+	}
+	return totalBytes
+}
+
 func (store *streamStore) Reset() {
+	if store == nil {
+		return
+	}
 	store.mu.Lock()
 	store.states = make(map[string]*streamState)
 	store.lastCleanup = time.Time{}
@@ -173,7 +238,7 @@ func (store *streamStore) Reset() {
 }
 
 func (store *streamStore) cleanupIfDueLocked(now time.Time) {
-	interval := store.ttl
+	interval := store.idleTTL
 	if interval <= 0 || interval > time.Minute {
 		interval = time.Minute
 	}
@@ -186,7 +251,7 @@ func (store *streamStore) cleanupIfDueLocked(now time.Time) {
 func (store *streamStore) cleanupLocked(now time.Time) {
 	expired := 0
 	for key, state := range store.states {
-		if !state.ExpiresAt.After(now) {
+		if store.stateExpiredLocked(state, now) {
 			delete(store.states, key)
 			expired++
 		}
@@ -194,6 +259,13 @@ func (store *streamStore) cleanupLocked(now time.Time) {
 	if store.observe && expired > 0 {
 		runtimeMetrics.streamExpired.Add(uint64(expired))
 	}
+}
+
+func (store *streamStore) stateExpiredLocked(state *streamState, now time.Time) bool {
+	if state == nil || !state.ExpiresAt.After(now) {
+		return true
+	}
+	return store.idleTTL > 0 && now.Sub(state.LastUpdatedAt) >= store.idleTTL
 }
 
 func (store *streamStore) evictOverflowLocked() {
@@ -332,7 +404,7 @@ func streamJSON(chunk []byte) (gjson.Result, bool) {
 	return gjson.Parse(data), true
 }
 
-func streamIdentity(root gjson.Result, history [][]byte, metadata map[string]any) string {
+func streamIdentity(root gjson.Result, history [][]byte, _ map[string]any) string {
 	if id := identityFromJSON(root); id != "" {
 		return id
 	}
@@ -341,13 +413,6 @@ func streamIdentity(root gjson.Result, history [][]byte, metadata map[string]any
 		if ok {
 			if id := identityFromJSON(previous); id != "" {
 				return id
-			}
-		}
-	}
-	for _, key := range []string{"idempotency_key", "execution_session_id"} {
-		if value, ok := metadata[key]; ok {
-			if id := strings.TrimSpace(valueAsString(value)); id != "" {
-				return "metadata:" + key + ":" + id
 			}
 		}
 	}

@@ -149,9 +149,11 @@ var dashboardTemplate = template.Must(template.New("dashboard").Parse(`<!doctype
         <article class="panel"><dl>
           <dt>Reasoning writes</dt><dd>{{.Snapshot.Capture.ReasoningWrites}}</dd>
           <dt>Completed streams</dt><dd>{{.Snapshot.Capture.CompletedStreams}}</dd>
+          <dt>Truncated stream reasoning</dt><dd>{{.Snapshot.Capture.TruncatedStreamReasoning}}</dd>
           <dt>Malformed payloads</dt><dd>{{.Snapshot.Errors.MalformedPayloads}}</dd>
           <dt>Missing tool-call IDs</dt><dd>{{.Snapshot.Errors.MissingToolCallIDs}}</dd>
           <dt>Missing stream IDs</dt><dd>{{.Snapshot.Errors.MissingStreamIDs}}</dd>
+          <dt>Recovered plugin panics</dt><dd>{{.Snapshot.Errors.RecoveredPanics}}</dd>
         </dl></article>
       </div>
     </section>
@@ -160,10 +162,14 @@ var dashboardTemplate = template.Must(template.New("dashboard").Parse(`<!doctype
       <div class="section-heading"><h2 id="runtime-heading">Runtime details</h2><p class="section-note">Privacy-safe configuration summary</p></div>
       <div class="grid grid-wide">
         <article class="panel"><dl>
-          <dt>Cache capacity</dt><dd>{{.Snapshot.Cache.Capacity}}</dd>
+          <dt>Cache entries</dt><dd>{{.Snapshot.Cache.Capacity}}</dd>
+          <dt>Cache byte capacity</dt><dd>{{.Snapshot.Cache.ByteCapacity}}</dd>
+          <dt>Retained reasoning bytes</dt><dd>{{.Snapshot.Cache.ReasoningBytes}}</dd>
+          <dt>Active stream bytes</dt><dd>{{.Snapshot.Cache.ActiveStreamBytes}}</dd>
           <dt>Cache TTL</dt><dd>{{.Snapshot.Cache.TTL}}</dd>
           <dt>Expired entries</dt><dd>{{.Snapshot.Cache.ExpiredEntries}}</dd>
           <dt>Evicted entries</dt><dd>{{.Snapshot.Cache.EvictedEntries}}</dd>
+          <dt>Rejected oversize entries</dt><dd>{{.Snapshot.Cache.RejectedOversize}}</dd>
           <dt>Expired streams</dt><dd>{{.Snapshot.Cache.ExpiredStreams}}</dd>
           <dt>Evicted streams</dt><dd>{{.Snapshot.Cache.EvictedStreams}}</dd>
         </dl></article>

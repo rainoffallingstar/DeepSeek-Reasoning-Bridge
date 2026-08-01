@@ -180,7 +180,11 @@ func registrationResponse() ([]byte, error) {
 				{Name: "fallback_strategy", Type: "enum", EnumValues: []string{"content", "placeholder", "passthrough"}, Description: "Fallback used when no exact tool-call cache entry exists."},
 				{Name: "placeholder_text", Type: "string", Description: "Text used by content and placeholder fallback modes."},
 				{Name: "cache_ttl", Type: "string", Description: "Maximum lifetime of reasoning and stream state entries."},
-				{Name: "cache_max_entries", Type: "integer", Description: "Maximum number of reasoning and stream state entries."},
+				{Name: "cache_max_entries", Type: "integer", Description: "Maximum number of completed reasoning and active stream entries."},
+				{Name: "cache_max_bytes", Type: "integer", Description: "Maximum total bytes retained by completed reasoning cache."},
+				{Name: "stream_max_lifetime", Type: "string", Description: "Absolute lifetime limit for an unfinished stream."},
+				{Name: "stream_idle_ttl", Type: "string", Description: "Idle timeout for an unfinished stream."},
+				{Name: "stream_max_reasoning_bytes", Type: "integer", Description: "Maximum reasoning bytes retained for one unfinished stream."},
 			},
 		},
 		Capabilities: pluginCaps{

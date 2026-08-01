@@ -4,9 +4,9 @@
 
 `deepseek-reasoning-bridge` is a dynamic CPA (CLIProxyAPI) plugin that preserves DeepSeek reasoning across tool-call turns and OpenAI, Anthropic, and Gemini protocol conversions.
 
-版本 `0.5.2` 已在本机 CPA `v7.2.88` 环境完成实际测试，包括流式 tool call 中断后继续会话的恢复场景。
+版本 `0.5.3` 增加了流状态的绝对生命周期、空闲超时与内存上限，用于防止长期运行时缓存无限增长。
 
-Version `0.5.2` has been tested successfully on a local CPA `v7.2.88` installation, including continuing a conversation after a streaming tool call is interrupted.
+Version `0.5.3` adds absolute stream lifetimes, idle timeouts, and memory limits to prevent unbounded cache growth during long-running operation.
 
 ## 功能 / Features
 
@@ -57,7 +57,7 @@ Copy the library into the platform plugin directory for the active CPA version. 
 
 ```bash
 cp bin/deepseek-reasoning-bridge.dylib \
-  "$HOME/Library/Application Support/Quotio/proxy/upstream/<version>/plugins/darwin/arm64/deepseek-reasoning-bridge-v0.5.2.dylib"
+  "$HOME/Library/Application Support/Quotio/proxy/upstream/<version>/plugins/darwin/arm64/deepseek-reasoning-bridge-v0.5.3.dylib"
 ```
 
 文件名应包含插件版本号。热重载时，新版本号必须高于已经部署的版本，CPA 才会选择新动态库。
@@ -78,6 +78,10 @@ deepseek-reasoning-bridge:
   placeholder_text: "[reasoning unavailable]"
   cache_ttl: "2h"
   cache_max_entries: 10000
+  cache_max_bytes: 67108864
+  stream_max_lifetime: "15m"
+  stream_idle_ttl: "2m"
+  stream_max_reasoning_bytes: 262144
 ```
 
 复制动态库后，修改一次 CPA 配置以触发插件热重载。部署过程中不要删除或修改其他 CPA 数据文件。
@@ -113,8 +117,12 @@ CPA resource routes may not be protected by management authentication. Apply the
 | `target_models` | `['deepseek-*']` | 插件处理的模型模式，不区分大小写。<br>Case-insensitive model patterns handled by the plugin. |
 | `fallback_strategy` | `content` | 可选值：`content`、`placeholder`、`passthrough`。<br>One of `content`, `placeholder`, or `passthrough`. |
 | `placeholder_text` | `[reasoning unavailable]` | 使用占位回退策略时填充的文本。<br>Text used by placeholder fallback. |
-| `cache_ttl` | `2h` | 推理缓存和未完成流状态的有效期。<br>Lifetime of reasoning cache and unfinished stream state. |
-| `cache_max_entries` | `10000` | 已完成推理缓存和活动流状态各自的最大条目数。<br>Maximum entries for completed reasoning and active streams. |
+| `cache_ttl` | `2h` | 已完成推理缓存的有效期。<br>Lifetime of completed reasoning cache entries. |
+| `cache_max_entries` | `10000` | 已完成推理缓存和活动流状态各自的最大条目数。<br>Maximum number of completed reasoning and active stream entries. |
+| `cache_max_bytes` | `67108864` | 已完成推理缓存的总字节上限。<br>Maximum total bytes retained by completed reasoning cache. |
+| `stream_max_lifetime` | `15m` | 未完成流从首次收到 chunk 起的绝对存活上限；新 chunk 不会续期。<br>Absolute lifetime of an unfinished stream; later chunks do not extend it. |
+| `stream_idle_ttl` | `2m` | 未完成流在无新 chunk 后的回收时间。<br>Idle timeout before an unfinished stream is reclaimed. |
+| `stream_max_reasoning_bytes` | `262144` | 单个未完成流可保留的最大推理字节数；超出时不缓存该不完整推理。<br>Maximum reasoning bytes for one unfinished stream; truncated reasoning is not cached. |
 
 推理内容仅存储在进程内存中，CPA 或插件重启后会丢失。精确恢复依赖客户端原样回传唯一的工具调用 ID。插件升级后，请使用新产生的 tool call 验证；升级前已经丢失的原始 reasoning 无法事后恢复。
 

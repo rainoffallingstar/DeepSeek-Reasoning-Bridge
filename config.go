@@ -11,26 +11,38 @@ import (
 )
 
 const (
-	defaultCacheTTL        = 2 * time.Hour
-	defaultCacheMaxEntries = 10_000
+	defaultCacheTTL                = 2 * time.Hour
+	defaultCacheMaxEntries         = 10_000
+	defaultCacheMaxBytes           = 64 * 1024 * 1024
+	defaultStreamMaxLifetime       = 15 * time.Minute
+	defaultStreamIdleTTL           = 2 * time.Minute
+	defaultStreamMaxReasoningBytes = 256 * 1024
 )
 
 // PluginConfig holds the plugin configuration supplied under
 // plugins.configs.deepseek-reasoning-bridge.
 type PluginConfig struct {
-	TargetModels     []string
-	FallbackStrategy string
-	PlaceholderText  string
-	CacheTTL         time.Duration
-	CacheMaxEntries  int
+	TargetModels            []string
+	FallbackStrategy        string
+	PlaceholderText         string
+	CacheTTL                time.Duration
+	CacheMaxEntries         int
+	CacheMaxBytes           int
+	StreamMaxLifetime       time.Duration
+	StreamIdleTTL           time.Duration
+	StreamMaxReasoningBytes int
 }
 
 type rawPluginConfig struct {
-	TargetModels     yaml.Node `yaml:"target_models"`
-	FallbackStrategy string    `yaml:"fallback_strategy"`
-	PlaceholderText  string    `yaml:"placeholder_text"`
-	CacheTTL         string    `yaml:"cache_ttl"`
-	CacheMaxEntries  *int      `yaml:"cache_max_entries"`
+	TargetModels            yaml.Node `yaml:"target_models"`
+	FallbackStrategy        string    `yaml:"fallback_strategy"`
+	PlaceholderText         string    `yaml:"placeholder_text"`
+	CacheTTL                string    `yaml:"cache_ttl"`
+	CacheMaxEntries         *int      `yaml:"cache_max_entries"`
+	CacheMaxBytes           *int      `yaml:"cache_max_bytes"`
+	StreamMaxLifetime       string    `yaml:"stream_max_lifetime"`
+	StreamIdleTTL           string    `yaml:"stream_idle_ttl"`
+	StreamMaxReasoningBytes *int      `yaml:"stream_max_reasoning_bytes"`
 }
 
 var (
@@ -40,11 +52,15 @@ var (
 
 func defaultConfig() PluginConfig {
 	return PluginConfig{
-		TargetModels:     []string{"deepseek-*"},
-		FallbackStrategy: "content",
-		PlaceholderText:  "[reasoning unavailable]",
-		CacheTTL:         defaultCacheTTL,
-		CacheMaxEntries:  defaultCacheMaxEntries,
+		TargetModels:            []string{"deepseek-*"},
+		FallbackStrategy:        "content",
+		PlaceholderText:         "[reasoning unavailable]",
+		CacheTTL:                defaultCacheTTL,
+		CacheMaxEntries:         defaultCacheMaxEntries,
+		CacheMaxBytes:           defaultCacheMaxBytes,
+		StreamMaxLifetime:       defaultStreamMaxLifetime,
+		StreamIdleTTL:           defaultStreamIdleTTL,
+		StreamMaxReasoningBytes: defaultStreamMaxReasoningBytes,
 	}
 }
 
@@ -90,6 +106,35 @@ func loadConfig(yamlBytes []byte) (PluginConfig, error) {
 		}
 		cfg.CacheMaxEntries = *raw.CacheMaxEntries
 	}
+	if raw.CacheMaxBytes != nil {
+		if *raw.CacheMaxBytes <= 0 {
+			return PluginConfig{}, fmt.Errorf("cache_max_bytes must be positive")
+		}
+		cfg.CacheMaxBytes = *raw.CacheMaxBytes
+	}
+	if value := strings.TrimSpace(raw.StreamMaxLifetime); value != "" {
+		lifetime, errParse := time.ParseDuration(value)
+		if errParse != nil || lifetime <= 0 {
+			return PluginConfig{}, fmt.Errorf("invalid stream_max_lifetime %q", value)
+		}
+		cfg.StreamMaxLifetime = lifetime
+	}
+	if value := strings.TrimSpace(raw.StreamIdleTTL); value != "" {
+		idleTTL, errParse := time.ParseDuration(value)
+		if errParse != nil || idleTTL <= 0 {
+			return PluginConfig{}, fmt.Errorf("invalid stream_idle_ttl %q", value)
+		}
+		cfg.StreamIdleTTL = idleTTL
+	}
+	if raw.StreamMaxReasoningBytes != nil {
+		if *raw.StreamMaxReasoningBytes <= 0 {
+			return PluginConfig{}, fmt.Errorf("stream_max_reasoning_bytes must be positive")
+		}
+		cfg.StreamMaxReasoningBytes = *raw.StreamMaxReasoningBytes
+	}
+	if cfg.StreamIdleTTL > cfg.StreamMaxLifetime {
+		return PluginConfig{}, fmt.Errorf("stream_idle_ttl must not exceed stream_max_lifetime")
+	}
 
 	cfg.TargetModels = normalizePatterns(cfg.TargetModels)
 	return cfg, nil
@@ -116,8 +161,8 @@ func decodeTargetModels(node yaml.Node) ([]string, error) {
 func storeConfig(cfg PluginConfig) {
 	reasoningEntries.Reset()
 	streamEntries.Reset()
-	reasoningEntries.Configure(cfg.CacheTTL, cfg.CacheMaxEntries)
-	streamEntries.Configure(cfg.CacheTTL, cfg.CacheMaxEntries)
+	reasoningEntries.Configure(cfg.CacheTTL, cfg.CacheMaxEntries, cfg.CacheMaxBytes)
+	streamEntries.Configure(cfg.StreamMaxLifetime, cfg.StreamIdleTTL, cfg.CacheMaxEntries, cfg.StreamMaxReasoningBytes)
 	configMu.Lock()
 	currentConfig = cfg
 	configMu.Unlock()

@@ -78,11 +78,18 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (status C.int) {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			runtimeMetrics.recoveredPanics.Add(1)
+			writeResponse(response, errorEnvelope("plugin_panic", "plugin recovered from an internal panic"))
+			status = 1
+		}
+	}()
 	if method == nil {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
 		return 1
